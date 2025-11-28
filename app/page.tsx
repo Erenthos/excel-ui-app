@@ -2,6 +2,16 @@
 
 import React, { useState, useEffect, useMemo } from "react";
 import * as XLSX from "xlsx";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend
+} from "recharts";
 
 type ParsedSheet = {
   name: string;
@@ -10,20 +20,31 @@ type ParsedSheet = {
 };
 
 type SortDirection = "asc" | "desc" | null;
+type ColumnType = "numeric" | "categorical" | "date" | "unknown";
+type TabId = "table" | "insights";
 
 export default function HomePage() {
   const [sheets, setSheets] = useState<ParsedSheet[]>([]);
   const [activeSheetIndex, setActiveSheetIndex] = useState(0);
   const [fileName, setFileName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
   const [searchQuery, setSearchQuery] = useState("");
   const [sortColumnIndex, setSortColumnIndex] = useState<number | null>(null);
   const [sortDirection, setSortDirection] = useState<SortDirection>(null);
+
   const [columnVisibility, setColumnVisibility] = useState<boolean[]>([]);
+  const [activeTab, setActiveTab] = useState<TabId>("table");
+
+  // For charts
+  const [chartCategoryIndex, setChartCategoryIndex] = useState<number | null>(
+    null
+  );
+  const [chartValueIndex, setChartValueIndex] = useState<number | null>(null);
 
   const activeSheet = sheets[activeSheetIndex];
 
-  // When sheet changes, reset column visibility
+  // When sheet changes: reset state
   useEffect(() => {
     if (activeSheet) {
       setColumnVisibility(new Array(activeSheet.headers.length).fill(true));
@@ -33,6 +54,9 @@ export default function HomePage() {
     setSearchQuery("");
     setSortColumnIndex(null);
     setSortDirection(null);
+    setActiveTab("table");
+    setChartCategoryIndex(null);
+    setChartValueIndex(null);
   }, [activeSheetIndex, sheets.length]);
 
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -98,7 +122,65 @@ export default function HomePage() {
   const totalRows = activeSheet?.rows.length ?? 0;
   const totalColumns = activeSheet?.headers.length ?? 0;
 
-  // Derived: filtered + sorted rows
+  // --- Column type detection for charts ---
+  const columnTypes: ColumnType[] = useMemo(() => {
+    if (!activeSheet) return [];
+    return activeSheet.headers.map((_, colIdx) => {
+      const colValues = activeSheet.rows
+        .map((row) => row[colIdx])
+        .filter((v) => v !== null && v !== undefined && v !== "");
+      if (!colValues.length) return "unknown";
+
+      let numericCount = 0;
+      let dateCount = 0;
+      const unique = new Set<string>();
+
+      for (const val of colValues) {
+        const s = String(val).trim();
+        unique.add(s);
+
+        const n = Number(s);
+        if (!Number.isNaN(n) && s !== "") numericCount++;
+
+        const d = new Date(s);
+        if (!Number.isNaN(d.getTime())) dateCount++;
+      }
+
+      const length = colValues.length;
+      const numericRatio = numericCount / length;
+      const dateRatio = dateCount / length;
+
+      if (dateRatio > 0.6) return "date";
+      if (numericRatio > 0.6) return "numeric";
+
+      if (unique.size <= Math.min(20, length)) return "categorical";
+      return "unknown";
+    });
+  }, [activeSheet]);
+
+  // Choose default chart columns based on heuristics
+  useEffect(() => {
+    if (!activeSheet || !columnTypes.length) return;
+
+    const defaultCategoryIndex =
+      columnTypes.findIndex((t) => t === "categorical") ?? -1;
+    const defaultValueIndex =
+      columnTypes.findIndex((t) => t === "numeric") ?? -1;
+
+    if (defaultCategoryIndex >= 0) {
+      setChartCategoryIndex(defaultCategoryIndex);
+    } else {
+      setChartCategoryIndex(null);
+    }
+
+    if (defaultValueIndex >= 0) {
+      setChartValueIndex(defaultValueIndex);
+    } else {
+      setChartValueIndex(null);
+    }
+  }, [activeSheet, columnTypes]);
+
+  // Process rows: filter + sort (for table)
   const processedRows = useMemo(() => {
     if (!activeSheet) return [];
 
@@ -123,12 +205,10 @@ export default function HomePage() {
         const aVal = a[sortColumnIndex];
         const bVal = b[sortColumnIndex];
 
-        // Handle null/undefined
         if (aVal == null && bVal == null) return 0;
         if (aVal == null) return sortDirection === "asc" ? -1 : 1;
         if (bVal == null) return sortDirection === "asc" ? 1 : -1;
 
-        // Try numeric sort first
         const aNum = Number(aVal);
         const bNum = Number(bVal);
         const bothNumeric = !Number.isNaN(aNum) && !Number.isNaN(bNum);
@@ -139,6 +219,7 @@ export default function HomePage() {
 
         const aStr = aVal.toString().toLowerCase();
         const bStr = bVal.toString().toLowerCase();
+
         if (aStr === bStr) return 0;
         if (sortDirection === "asc") {
           return aStr < bStr ? -1 : 1;
@@ -157,11 +238,10 @@ export default function HomePage() {
   }, [activeSheet, columnVisibility]);
 
   const visibleRowCount = processedRows.length;
-  const rowsToDisplay = processedRows.slice(0, 200); // cap for performance
+  const rowsToDisplay = processedRows.slice(0, 200);
 
   function toggleSort(index: number) {
     if (sortColumnIndex === index) {
-      // cycle: asc -> desc -> none
       if (sortDirection === "asc") {
         setSortDirection("desc");
       } else if (sortDirection === "desc") {
@@ -178,14 +258,52 @@ export default function HomePage() {
 
   function toggleColumn(index: number) {
     setColumnVisibility((prev) => {
-      if (!prev.length) {
-        return columnVisibility;
-      }
+      if (!prev.length) return prev;
       const copy = [...prev];
       copy[index] = !copy[index];
       return copy;
     });
   }
+
+  // --- Chart data generation (group numeric by category) ---
+  const chartData = useMemo(() => {
+    if (
+      !activeSheet ||
+      chartCategoryIndex === null ||
+      chartValueIndex === null
+    ) {
+      return [];
+    }
+
+    const groupMap = new Map<string, number>();
+
+    for (const row of activeSheet.rows) {
+      const catRaw = row[chartCategoryIndex];
+      const valRaw = row[chartValueIndex];
+
+      if (catRaw === null || catRaw === undefined || catRaw === "") continue;
+      const num = Number(valRaw);
+      if (Number.isNaN(num)) continue;
+
+      const key = String(catRaw);
+      groupMap.set(key, (groupMap.get(key) ?? 0) + num);
+    }
+
+    const entries = Array.from(groupMap.entries()).map(([category, value]) => ({
+      category,
+      value
+    }));
+
+    // Sort by value descending & cap to top 25 for readability
+    entries.sort((a, b) => b.value - a.value);
+    return entries.slice(0, 25);
+  }, [activeSheet, chartCategoryIndex, chartValueIndex]);
+
+  const hasChartConfig =
+    activeSheet &&
+    chartCategoryIndex !== null &&
+    chartValueIndex !== null &&
+    chartData.length > 0;
 
   return (
     <main className="h-screen w-screen overflow-hidden flex flex-col">
@@ -193,14 +311,14 @@ export default function HomePage() {
       <header className="flex items-center justify-between border-b border-slate-800/80 bg-slate-950/80 px-6 py-3 backdrop-blur-md">
         <div className="flex items-center gap-3">
           <div className="flex h-9 w-9 items-center justify-center rounded-2xl bg-gradient-to-tr from-sky-500 to-emerald-400 text-slate-950 text-xl">
-            ✨
+            📊
           </div>
           <div>
             <h1 className="text-lg font-semibold tracking-tight">
               Excel Visualizer
             </h1>
             <p className="text-xs text-slate-400">
-              Upload, explore, and interact with your spreadsheet visually.
+              Full-screen data grid with auto-detected charts & insights.
             </p>
           </div>
         </div>
@@ -232,9 +350,9 @@ export default function HomePage() {
         </div>
       </header>
 
-      {/* Main content area: sidebar + table */}
+      {/* Main content */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Left sidebar */}
+        {/* Sidebar */}
         <aside className="w-72 border-r border-slate-800/80 bg-slate-950/70 backdrop-blur-xl px-4 py-4 flex flex-col gap-4">
           {/* Sheets */}
           <section>
@@ -246,7 +364,7 @@ export default function HomePage() {
                 {sheets.length || 0}
               </span>
             </div>
-            <div className="space-y-1 max-h-40 overflow-auto custom-scroll">
+            <div className="space-y-1 max-h-40 overflow-auto">
               {sheets.length === 0 && (
                 <p className="text-xs text-slate-500">
                   No sheets yet. Upload a file to begin.
@@ -342,7 +460,7 @@ export default function HomePage() {
                 </button>
               )}
             </p>
-            <div className="max-h-40 overflow-auto custom-scroll space-y-1">
+            <div className="max-h-40 overflow-auto space-y-1">
               {!activeSheet && (
                 <p className="text-xs text-slate-500">
                   Load a sheet to manage columns.
@@ -382,21 +500,45 @@ export default function HomePage() {
           )}
         </aside>
 
-        {/* Main table area */}
+        {/* Main content area (tabs) */}
         <section className="flex-1 flex flex-col bg-slate-950/60 backdrop-blur-xl">
+          {/* Tabs */}
+          <div className="flex items-center border-b border-slate-800/80 px-4">
+            <button
+              className={`px-4 py-2 text-xs font-medium border-b-2 ${
+                activeTab === "table"
+                  ? "border-sky-400 text-sky-200"
+                  : "border-transparent text-slate-400 hover:text-slate-200"
+              }`}
+              onClick={() => setActiveTab("table")}
+            >
+              Table View
+            </button>
+            <button
+              className={`px-4 py-2 text-xs font-medium border-b-2 ${
+                activeTab === "insights"
+                  ? "border-emerald-400 text-emerald-200"
+                  : "border-transparent text-slate-400 hover:text-slate-200"
+              }`}
+              onClick={() => setActiveTab("insights")}
+            >
+              Charts & Insights
+            </button>
+          </div>
+
           {!activeSheet ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center px-6">
-              <div className="text-6xl">📊</div>
+              <div className="text-6xl">✨</div>
               <p className="text-sm text-slate-200">
-                Upload an Excel file to see an interactive preview.
+                Upload an Excel file to see an interactive preview and auto
+                charts.
               </p>
               <p className="text-xs text-slate-400 max-w-md">
-                The viewer auto-detects sheets and headers, lets you search,
-                sort, and hide columns, and can handle up to a few thousand rows
-                comfortably in your browser.
+                Sheets and data types are detected automatically. Switch between
+                grid and charts using the tabs above.
               </p>
             </div>
-          ) : (
+          ) : activeTab === "table" ? (
             <>
               {/* Table meta bar */}
               <div className="flex items-center justify-between border-b border-slate-800/80 px-4 py-2 text-[11px] text-slate-300">
@@ -506,6 +648,135 @@ export default function HomePage() {
                 </table>
               </div>
             </>
+          ) : (
+            // Charts & Insights tab
+            <div className="flex-1 flex flex-col p-4 gap-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <h2 className="text-sm font-semibold text-emerald-200">
+                    Auto-generated Insights
+                  </h2>
+                  <p className="text-[11px] text-slate-400 max-w-xl">
+                    We detect categorical and numeric columns, then aggregate
+                    numeric values by category to build a chart. You can change
+                    the axes using the dropdowns.
+                  </p>
+                </div>
+
+                {/* Dropdowns */}
+                <div className="flex flex-wrap gap-2 text-xs">
+                  <div className="flex flex-col">
+                    <span className="mb-1 text-[10px] uppercase tracking-wide text-slate-400">
+                      Category (X axis)
+                    </span>
+                    <select
+                      value={
+                        chartCategoryIndex !== null
+                          ? chartCategoryIndex
+                          : undefined
+                      }
+                      onChange={(e) =>
+                        setChartCategoryIndex(Number(e.target.value))
+                      }
+                      className="rounded-lg bg-slate-900/80 border border-slate-700/80 px-2 py-1 text-xs text-slate-100 focus:outline-none focus:ring-1 focus:ring-emerald-400"
+                    >
+                      <option value="" disabled>
+                        Select column
+                      </option>
+                      {activeSheet.headers.map((header, idx) => (
+                        <option key={idx} value={idx}>
+                          {header || `Column ${idx + 1}`}{" "}
+                          {columnTypes[idx] ? `(${columnTypes[idx]})` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="flex flex-col">
+                    <span className="mb-1 text-[10px] uppercase tracking-wide text-slate-400">
+                      Value (Y axis)
+                    </span>
+                    <select
+                      value={
+                        chartValueIndex !== null
+                          ? chartValueIndex
+                          : undefined
+                      }
+                      onChange={(e) =>
+                        setChartValueIndex(Number(e.target.value))
+                      }
+                      className="rounded-lg bg-slate-900/80 border border-slate-700/80 px-2 py-1 text-xs text-slate-100 focus:outline-none focus:ring-1 focus:ring-emerald-400"
+                    >
+                      <option value="" disabled>
+                        Select column
+                      </option>
+                      {activeSheet.headers.map((header, idx) => (
+                        <option key={idx} value={idx}>
+                          {header || `Column ${idx + 1}`}{" "}
+                          {columnTypes[idx] ? `(${columnTypes[idx]})` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              {/* Chart area */}
+              <div className="flex-1 rounded-2xl border border-emerald-500/25 bg-slate-950/70 p-4 flex flex-col gap-3">
+                {!hasChartConfig ? (
+                  <div className="flex flex-1 flex-col items-center justify-center text-center gap-2">
+                    <div className="text-4xl">🧠</div>
+                    <p className="text-xs text-slate-200">
+                      Not enough structured information to build a chart yet.
+                    </p>
+                    <p className="text-[11px] text-slate-400 max-w-sm">
+                      Make sure you have at least one column with repeated
+                      categories (e.g. "Item", "Region") and one numeric column
+                      (e.g. "Amount", "Quantity"). Then select them above.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex items-center justify-between text-[11px] text-slate-300">
+                      <span>
+                        Summed{" "}
+                        <span className="text-emerald-300 font-semibold">
+                          {activeSheet.headers[chartValueIndex!] ||
+                            `Column ${chartValueIndex! + 1}`}
+                        </span>{" "}
+                        by{" "}
+                        <span className="text-emerald-300 font-semibold">
+                          {activeSheet.headers[chartCategoryIndex!] ||
+                            `Column ${chartCategoryIndex! + 1}`}
+                        </span>
+                      </span>
+                      <span className="text-slate-500">
+                        Showing top {chartData.length} categories by value
+                      </span>
+                    </div>
+
+                    <div className="flex-1 min-h-[260px]">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 60 }}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis
+                            dataKey="category"
+                            angle={-35}
+                            textAnchor="end"
+                            interval={0}
+                            height={60}
+                          />
+                          <YAxis />
+                          <Tooltip />
+                          <Legend />
+                          <Bar dataKey="value" />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
           )}
         </section>
       </div>
